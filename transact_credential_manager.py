@@ -20,6 +20,17 @@ KEYRING_SERVICE_AD = "transact-access-manager-ad"
 _TRANSACT_KEYS = ("consumer_key", "consumer_secret", "hostname", "route_scheme", "route_value")
 _AD_KEYS = ("server", "username", "password", "use_ssl")
 
+# Default lookup-field configuration. Seeded on first run; editable in Settings.
+# Each field maps a user-facing label to an AD/LDAP attribute name.
+DEFAULT_LOOKUP_FIELDS = [
+    {"label": "CA8 Student ID", "attr": "extensionAttribute8"},
+    {"label": "CA2 HR ID",      "attr": "extensionAttribute2"},
+    {"label": "UCCS ID",        "attr": "employeeID"},
+    {"label": "Username",       "attr": "cn"},
+    {"label": "Email",          "attr": "mail"},
+]
+DEFAULT_CUSTOMER_NUMBER_ATTR = "employeeID"
+
 
 class TransactCredentialManager:
     """Read / write credentials via keyring and non-secret settings via JSON."""
@@ -104,3 +115,54 @@ class TransactCredentialManager:
         os.makedirs(CONFIG_DIR, exist_ok=True)
         with open(self._settings_path, "w") as f:
             json.dump(settings, f, indent=2)
+
+    # ── Lookup field configuration ──────────────────────────────────────
+
+    def get_lookup_fields(self):
+        """Return the configured list of [{"label", "attr"}, ...].
+
+        Falls back to DEFAULT_LOOKUP_FIELDS if not yet configured or invalid.
+        """
+        settings = self.load_settings()
+        raw = settings.get("lookup_fields")
+        if not isinstance(raw, list) or not raw:
+            return [dict(f) for f in DEFAULT_LOOKUP_FIELDS]
+        out = []
+        for item in raw:
+            if (isinstance(item, dict)
+                    and item.get("label") and item.get("attr")):
+                out.append({"label": str(item["label"]),
+                            "attr": str(item["attr"])})
+        return out or [dict(f) for f in DEFAULT_LOOKUP_FIELDS]
+
+    def set_lookup_fields(self, fields):
+        """Persist the list of lookup fields.
+
+        ``fields`` is a list of {"label", "attr"} dicts.
+        """
+        settings = self.load_settings()
+        settings["lookup_fields"] = [
+            {"label": str(f["label"]), "attr": str(f["attr"])}
+            for f in fields
+            if f.get("label") and f.get("attr")
+        ]
+        self.save_settings(settings)
+
+    def get_customer_number_attr(self):
+        """Return the AD attribute that maps to Transact CustomerNumber."""
+        settings = self.load_settings()
+        attr = settings.get("customer_number_attr")
+        if attr:
+            return str(attr)
+        # Fall back: if the default is among configured fields, use it;
+        # otherwise use the first configured field's attribute.
+        fields = self.get_lookup_fields()
+        attrs = [f["attr"] for f in fields]
+        if DEFAULT_CUSTOMER_NUMBER_ATTR in attrs:
+            return DEFAULT_CUSTOMER_NUMBER_ATTR
+        return attrs[0] if attrs else DEFAULT_CUSTOMER_NUMBER_ATTR
+
+    def set_customer_number_attr(self, attr):
+        settings = self.load_settings()
+        settings["customer_number_attr"] = str(attr)
+        self.save_settings(settings)

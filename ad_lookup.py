@@ -20,17 +20,10 @@ try:
 except ImportError:
     _ldap3_available = False
 
-# Maps human-readable field names to AD attribute names.
-AD_LOOKUP_FIELDS = {
-    "CA8 Student ID": "extensionAttribute8",
-    "CA2 HR ID": "extensionAttribute2",
-    "UCCS ID": "employeeID",
-    "Username": "cn",
-    "Email": "mail",
-}
-
-# Attributes we always want back from AD for display/mapping purposes.
-RETURN_ATTRS = ["employeeID", "displayName", "mail"]
+# Attributes always requested from AD for display purposes. Callers append
+# any additional attributes they need (e.g. the configured customer-number
+# attribute and any other lookup-field attrs) via ``extra_attrs``.
+RETURN_ATTRS = ["displayName", "mail"]
 
 
 class ADLookupClient:
@@ -235,7 +228,8 @@ class ADLookupClient:
 
     # ── Batch lookup ────────────────────────────────────────────────────
 
-    def lookup_batch(self, identifiers, ad_field, progress_callback=None):
+    def lookup_batch(self, identifiers, ad_field, extra_attrs=None,
+                     progress_callback=None):
         """Resolve a list of identifiers against AD.
 
         Parameters
@@ -244,6 +238,8 @@ class ADLookupClient:
             Raw identifiers from the input file.
         ad_field : str
             AD attribute name to query (e.g. ``extensionAttribute8``).
+        extra_attrs : list[str] | None
+            Additional AD attributes to request beyond ``RETURN_ATTRS``.
         progress_callback : callable(current, total) | None
             Called after each lookup with (current_index, total_count).
 
@@ -257,7 +253,7 @@ class ADLookupClient:
         for i, ident in enumerate(identifiers):
             ident = ident.strip()
             if ident:
-                results.append(self.lookup(ident, ad_field))
+                results.append(self.lookup(ident, ad_field, extra_attrs))
             else:
                 results.append(None)
             if progress_callback:

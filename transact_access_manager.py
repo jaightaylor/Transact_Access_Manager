@@ -17,7 +17,7 @@ import tkinter as tk
 from dataclasses import dataclass, field
 from tkinter import ttk, filedialog, messagebox
 
-from ad_lookup import ADLookupClient, AD_LOOKUP_FIELDS, RETURN_ATTRS
+from ad_lookup import ADLookupClient, RETURN_ATTRS
 from transact_api import TransactOAuthClient
 from transact_credential_manager import TransactCredentialManager
 
@@ -98,9 +98,10 @@ class ResolvedUser:
     """A user whose identifier has been resolved via AD."""
     identifier: str
     display_name: str
-    employee_id: str        # = Transact CustomerNumber
+    customer_number: str    # value of the configured customer-number attribute
     email: str
     row_index: int          # index in input data for reference
+    extra: dict = field(default_factory=dict)  # any additional AD attrs fetched
 
 
 @dataclass
@@ -124,7 +125,7 @@ class StagedAction:
 @dataclass
 class StagedCardAction:
     """One planned card or customer operation."""
-    employee_id: str
+    customer_number: str
     display_name: str
     action_type: str        # "Card Status", "Card Lost", "Card Issue", "Customer Active"
     card_number: str = ""
@@ -139,21 +140,25 @@ class StagedCardAction:
 # ── Credential dialog ──────────────────────────────────────────────────────
 
 class TransactCredentialDialog(tk.Toplevel):
-    """Two-tab modal dialog for Transact OAuth + AD/LDAP credentials."""
+    """Three-tab modal dialog for Transact OAuth, AD/LDAP, and lookup fields."""
 
-    def __init__(self, parent, transact_creds=None, ad_creds=None):
+    def __init__(self, parent, transact_creds=None, ad_creds=None,
+                 lookup_fields=None, customer_number_attr=None):
         super().__init__(parent)
-        self.title("Credentials")
-        self.geometry("460x420")
-        self.resizable(False, False)
+        self.title("Settings")
+        self.geometry("560x500")
+        self.resizable(True, True)
+        self.minsize(520, 460)
         self.transient(parent)
         self.grab_set()
 
         self.result = None
+        self._lookup_fields = [dict(f) for f in (lookup_fields or [])]
+        self._customer_attr = customer_number_attr or ""
 
         self.update_idletasks()
-        x = parent.winfo_x() + (parent.winfo_width() // 2) - 230
-        y = parent.winfo_y() + (parent.winfo_height() // 2) - 210
+        x = parent.winfo_x() + (parent.winfo_width() // 2) - 280
+        y = parent.winfo_y() + (parent.winfo_height() // 2) - 250
         self.geometry(f"+{x}+{y}")
 
         notebook = ttk.Notebook(self)
@@ -213,6 +218,62 @@ class TransactCredentialDialog(tk.Toplevel):
             row=3, column=1, sticky=tk.W, pady=8)
         a_frame.columnconfigure(1, weight=1)
 
+        # ── Lookup Fields tab ───────────────────────────────────────────
+        lf_frame = ttk.Frame(notebook, padding=10)
+        notebook.add(lf_frame, text="Lookup Fields")
+
+        ttk.Label(
+            lf_frame,
+            text=("Configure which AD attributes appear as search fields. "
+                  "One field — marked ★ — is used as the Transact "
+                  "CustomerNumber."),
+            wraplength=500, justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        tree_holder = ttk.Frame(lf_frame)
+        tree_holder.pack(fill=tk.BOTH, expand=True)
+
+        self._lf_tree = ttk.Treeview(
+            tree_holder, columns=("cust", "label", "attr"),
+            show="headings", height=7, selectmode="browse")
+        self._lf_tree.heading("cust", text="Customer#")
+        self._lf_tree.heading("label", text="Label")
+        self._lf_tree.heading("attr", text="AD Attribute")
+        self._lf_tree.column("cust", width=80, minwidth=70, anchor=tk.CENTER,
+                             stretch=False)
+        self._lf_tree.column("label", width=180, minwidth=120)
+        self._lf_tree.column("attr", width=200, minwidth=140)
+
+        lf_vsb = ttk.Scrollbar(tree_holder, orient=tk.VERTICAL,
+                               command=self._lf_tree.yview)
+        self._lf_tree.configure(yscrollcommand=lf_vsb.set)
+        self._lf_tree.grid(row=0, column=0, sticky="nsew")
+        lf_vsb.grid(row=0, column=1, sticky="ns")
+        tree_holder.rowconfigure(0, weight=1)
+        tree_holder.columnconfigure(0, weight=1)
+
+        self._lf_tree.bind("<Double-1>", lambda e: self._lf_edit())
+
+        btn_row = ttk.Frame(lf_frame)
+        btn_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(btn_row, text="Add...",
+                   command=self._lf_add).pack(side=tk.LEFT)
+        ttk.Button(btn_row, text="Edit...",
+                   command=self._lf_edit).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(btn_row, text="Remove",
+                   command=self._lf_remove).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(btn_row, text="Move Up",
+                   command=lambda: self._lf_move(-1)).pack(
+            side=tk.LEFT, padx=(12, 0))
+        ttk.Button(btn_row, text="Move Down",
+                   command=lambda: self._lf_move(1)).pack(
+            side=tk.LEFT, padx=(4, 0))
+        ttk.Button(btn_row, text="Set as Customer #",
+                   command=self._lf_set_customer).pack(
+            side=tk.RIGHT)
+
+        self._lf_refresh()
+
         # ── Buttons ─────────────────────────────────────────────────────
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill=tk.X, padx=10, pady=10)
@@ -226,13 +287,175 @@ class TransactCredentialDialog(tk.Toplevel):
 
         self._t_entries["hostname"].focus()
 
+    # ── Lookup-field tab helpers ────────────────────────────────────────
+
+    def _lf_refresh(self):
+        self._lf_tree.delete(*self._lf_tree.get_children())
+        for i, f in enumerate(self._lookup_fields):
+            star = "★" if f["attr"] == self._customer_attr else ""
+            self._lf_tree.insert("", tk.END, iid=str(i),
+                                 values=(star, f["label"], f["attr"]))
+
+    def _lf_selected_index(self):
+        sel = self._lf_tree.selection()
+        if not sel:
+            return None
+        try:
+            return int(sel[0])
+        except ValueError:
+            return None
+
+    def _lf_prompt(self, initial_label="", initial_attr=""):
+        """Prompt for label + AD attribute. Returns (label, attr) or None."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Lookup Field")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        dlg.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() // 2) - 170
+        y = self.winfo_y() + (self.winfo_height() // 2) - 80
+        dlg.geometry(f"340x150+{x}+{y}")
+
+        body = ttk.Frame(dlg, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(body, text="Label:").grid(row=0, column=0, sticky=tk.W,
+                                            pady=6, padx=(0, 8))
+        label_entry = ttk.Entry(body, width=30)
+        label_entry.insert(0, initial_label)
+        label_entry.grid(row=0, column=1, sticky=tk.EW, pady=6)
+
+        ttk.Label(body, text="AD Attribute:").grid(row=1, column=0, sticky=tk.W,
+                                                   pady=6, padx=(0, 8))
+        attr_entry = ttk.Entry(body, width=30)
+        attr_entry.insert(0, initial_attr)
+        attr_entry.grid(row=1, column=1, sticky=tk.EW, pady=6)
+
+        body.columnconfigure(1, weight=1)
+
+        result = [None]
+
+        def _ok(event=None):
+            lbl = label_entry.get().strip()
+            attr = attr_entry.get().strip()
+            if not lbl or not attr:
+                messagebox.showwarning("Required",
+                                       "Both fields are required.",
+                                       parent=dlg)
+                return
+            result[0] = (lbl, attr)
+            dlg.destroy()
+
+        def _cancel(event=None):
+            dlg.destroy()
+
+        btns = ttk.Frame(dlg, padding=(12, 0, 12, 12))
+        btns.pack(fill=tk.X)
+        ttk.Button(btns, text="Cancel", command=_cancel).pack(
+            side=tk.RIGHT, padx=(5, 0))
+        ttk.Button(btns, text="OK", command=_ok,
+                   default="active").pack(side=tk.RIGHT)
+        dlg.bind("<Return>", _ok)
+        dlg.bind("<Escape>", _cancel)
+        label_entry.focus()
+        dlg.wait_window()
+        return result[0]
+
+    def _lf_add(self):
+        picked = self._lf_prompt()
+        if not picked:
+            return
+        label, attr = picked
+        if any(f["attr"] == attr for f in self._lookup_fields):
+            messagebox.showwarning(
+                "Duplicate",
+                f"An entry for '{attr}' already exists.", parent=self)
+            return
+        self._lookup_fields.append({"label": label, "attr": attr})
+        if not self._customer_attr:
+            self._customer_attr = attr
+        self._lf_refresh()
+
+    def _lf_edit(self):
+        idx = self._lf_selected_index()
+        if idx is None:
+            return
+        f = self._lookup_fields[idx]
+        picked = self._lf_prompt(f["label"], f["attr"])
+        if not picked:
+            return
+        new_label, new_attr = picked
+        # Check for attr collision with a different row
+        for j, other in enumerate(self._lookup_fields):
+            if j != idx and other["attr"] == new_attr:
+                messagebox.showwarning(
+                    "Duplicate",
+                    f"An entry for '{new_attr}' already exists.", parent=self)
+                return
+        # If we're changing the attr and this row is the customer source,
+        # update the customer attr too
+        if self._customer_attr == f["attr"]:
+            self._customer_attr = new_attr
+        self._lookup_fields[idx] = {"label": new_label, "attr": new_attr}
+        self._lf_refresh()
+
+    def _lf_remove(self):
+        idx = self._lf_selected_index()
+        if idx is None:
+            return
+        f = self._lookup_fields[idx]
+        if not messagebox.askyesno(
+                "Remove", f"Remove '{f['label']}'?", parent=self):
+            return
+        removed = self._lookup_fields.pop(idx)
+        if removed["attr"] == self._customer_attr:
+            self._customer_attr = (self._lookup_fields[0]["attr"]
+                                   if self._lookup_fields else "")
+        self._lf_refresh()
+
+    def _lf_move(self, delta):
+        idx = self._lf_selected_index()
+        if idx is None:
+            return
+        new_idx = idx + delta
+        if not (0 <= new_idx < len(self._lookup_fields)):
+            return
+        self._lookup_fields[idx], self._lookup_fields[new_idx] = (
+            self._lookup_fields[new_idx], self._lookup_fields[idx])
+        self._lf_refresh()
+        self._lf_tree.selection_set(str(new_idx))
+
+    def _lf_set_customer(self):
+        idx = self._lf_selected_index()
+        if idx is None:
+            return
+        self._customer_attr = self._lookup_fields[idx]["attr"]
+        self._lf_refresh()
+        self._lf_tree.selection_set(str(idx))
+
     def _save(self, event=None):
+        if not self._lookup_fields:
+            messagebox.showwarning(
+                "Lookup Fields",
+                "At least one lookup field is required.", parent=self)
+            return
+        if not self._customer_attr or not any(
+                f["attr"] == self._customer_attr for f in self._lookup_fields):
+            messagebox.showwarning(
+                "Customer #",
+                "Mark one field as the Transact CustomerNumber "
+                "(use 'Set as Customer #').", parent=self)
+            return
         self.result = {
             "transact": {k: e.get().strip() for k, e in self._t_entries.items()},
             "ad": {
                 **{k: e.get().strip() for k, e in self._a_entries.items()},
                 "use_ssl": self._ssl_var.get(),
             },
+            "lookup_fields": [dict(f) for f in self._lookup_fields],
+            "customer_number_attr": self._customer_attr,
         }
         # Keep password unstripped
         self.result["ad"]["password"] = self._a_entries["password"].get()
@@ -259,10 +482,6 @@ class TransactAccessManagerApp(tk.Tk):
         self.minsize(1200, 750)
 
         style = ttk.Style(self)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
 
         # Bold style for the three key action buttons
         style.configure("Bold.TButton", font=("Helvetica", 10, "bold"))
@@ -271,6 +490,10 @@ class TransactAccessManagerApp(tk.Tk):
         self.cred_manager = TransactCredentialManager()
         self.api_client = None      # TransactOAuthClient
         self.ad_client = None       # ADLookupClient
+
+        # Lookup-field configuration (populated from settings)
+        self._lookup_fields = self.cred_manager.get_lookup_fields()
+        self._customer_attr = self.cred_manager.get_customer_number_attr()
 
         self.csv_path = None
         self.csv_headers = []
@@ -296,6 +519,109 @@ class TransactAccessManagerApp(tk.Tk):
         self._load_saved_settings()
         self.after(200, self._startup_sequence)
         self._start_keepalive()
+
+    # ════════════════════════════════════════════════════════════════════
+    #  Lookup-field helpers
+    # ════════════════════════════════════════════════════════════════════
+
+    def _lookup_labels(self):
+        """Ordered list of labels for use in comboboxes."""
+        return [f["label"] for f in self._lookup_fields]
+
+    def _attr_for_label(self, label):
+        """Return the AD attribute for a given label, or None."""
+        for f in self._lookup_fields:
+            if f["label"] == label:
+                return f["attr"]
+        return None
+
+    def _label_for_attr(self, attr):
+        """Return the label for a given AD attribute, or None."""
+        for f in self._lookup_fields:
+            if f["attr"] == attr:
+                return f["label"]
+        return None
+
+    def _customer_label(self):
+        """Label of the configured customer-number field (or the attr name)."""
+        return self._label_for_attr(self._customer_attr) or self._customer_attr
+
+    def _all_lookup_attrs(self):
+        """All AD attributes referenced by lookup fields + customer-number."""
+        attrs = [f["attr"] for f in self._lookup_fields]
+        if self._customer_attr not in attrs:
+            attrs.append(self._customer_attr)
+        return attrs
+
+    def _rebuild_single_info_panel(self):
+        """Populate the AD Info panel using configured lookup fields.
+
+        Rows: Name, Email, plus each configured lookup field. The configured
+        customer-number field is marked with " ★".
+        """
+        if not hasattr(self, "_single_info_frame"):
+            return
+        for child in self._single_info_frame.winfo_children():
+            child.destroy()
+        self._single_result_vars = {}
+
+        # Always-present fields
+        always = [("Name", "displayName"), ("Email", "mail")]
+        rows = list(always)
+        seen_attrs = {a for _, a in always}
+        for f in self._lookup_fields:
+            if f["attr"] in seen_attrs:
+                continue
+            label = f["label"]
+            if f["attr"] == self._customer_attr:
+                label += "  ★"
+            rows.append((label, f["attr"]))
+            seen_attrs.add(f["attr"])
+        # If customer-number attr isn't in lookup fields at all, still show it
+        if self._customer_attr not in seen_attrs:
+            rows.append((f"{self._customer_attr}  ★", self._customer_attr))
+
+        for i, (label, attr) in enumerate(rows):
+            ttk.Label(self._single_info_frame, text=f"{label}:").grid(
+                row=i, column=0, sticky=tk.W, padx=(0, 6), pady=1)
+            var = tk.StringVar()
+            entry = ttk.Entry(self._single_info_frame, textvariable=var,
+                              state="readonly", width=30)
+            entry.grid(row=i, column=1, sticky=tk.EW, pady=1)
+            self._single_result_vars[attr] = var
+        self._single_info_frame.columnconfigure(1, weight=1)
+
+    def _apply_lookup_field_changes(self):
+        """Refresh UI widgets that depend on the lookup-field config."""
+        labels = self._lookup_labels()
+
+        # Preserve current selections where possible
+        prev_bulk = self.ad_field_combo.get() if hasattr(self, "ad_field_combo") else ""
+        prev_single = (self.single_ad_field_combo.get()
+                       if hasattr(self, "single_ad_field_combo") else "")
+
+        if hasattr(self, "ad_field_combo"):
+            self.ad_field_combo["values"] = labels
+            if prev_bulk in labels:
+                self.ad_field_combo.set(prev_bulk)
+            elif labels:
+                self.ad_field_combo.current(0)
+            else:
+                self.ad_field_combo.set("")
+
+        if hasattr(self, "single_ad_field_combo"):
+            self.single_ad_field_combo["values"] = labels
+            if prev_single in labels:
+                self.single_ad_field_combo.set(prev_single)
+            elif labels:
+                # Prefer Username default
+                idx = next((i for i, l in enumerate(labels)
+                            if l.lower() == "username"), 0)
+                self.single_ad_field_combo.current(idx)
+            else:
+                self.single_ad_field_combo.set("")
+
+        self._rebuild_single_info_panel()
 
     # ════════════════════════════════════════════════════════════════════
     #  UI construction
@@ -336,7 +662,7 @@ class TransactAccessManagerApp(tk.Tk):
         #  TOP PANE — User input notebook (Bulk CSV / Single User)
         # ════════════════════════════════════════════════════════════════
         top_pane_frame = ttk.Frame(main_pane)
-        main_pane.add(top_pane_frame, minsize=120, stretch="always")
+        main_pane.add(top_pane_frame, minsize=200, height=520, stretch="always")
 
         self.input_notebook = ttk.Notebook(top_pane_frame)
         self.input_notebook.pack(fill=tk.BOTH, expand=True)
@@ -376,10 +702,11 @@ class TransactAccessManagerApp(tk.Tk):
 
         ttk.Label(row2, text="AD Field:").pack(side=tk.LEFT, padx=(0, 4))
         self.ad_field_combo = ttk.Combobox(
-            row2, values=list(AD_LOOKUP_FIELDS.keys()),
+            row2, values=self._lookup_labels(),
             state="readonly", width=18)
         self.ad_field_combo.pack(side=tk.LEFT, padx=(0, 12))
-        self.ad_field_combo.current(0)
+        if self._lookup_fields:
+            self.ad_field_combo.current(0)
 
         self.resolve_btn = ttk.Button(row2, text="Resolve Users",
                                       command=self._resolve_users,
@@ -418,10 +745,17 @@ class TransactAccessManagerApp(tk.Tk):
 
         ttk.Label(search_row, text="Search By:").pack(side=tk.LEFT, padx=(0, 4))
         self.single_ad_field_combo = ttk.Combobox(
-            search_row, values=list(AD_LOOKUP_FIELDS.keys()),
+            search_row, values=self._lookup_labels(),
             state="readonly", width=18)
         self.single_ad_field_combo.pack(side=tk.LEFT, padx=(0, 12))
-        self.single_ad_field_combo.current(3)  # Default to Username
+        # Default to "Username" if present, else the first field
+        default_idx = 0
+        for i, lbl in enumerate(self._lookup_labels()):
+            if lbl.lower() == "username":
+                default_idx = i
+                break
+        if self._lookup_fields:
+            self.single_ad_field_combo.current(default_idx)
 
         ttk.Label(search_row, text="Value:").pack(side=tk.LEFT, padx=(0, 4))
         self.single_search_var = tk.StringVar()
@@ -448,27 +782,13 @@ class TransactAccessManagerApp(tk.Tk):
         left_frame = ttk.Frame(result_pane)
         result_pane.add(left_frame, minsize=250, stretch="always")
 
-        # AD result fields
-        info_frame = ttk.Labelframe(left_frame, text="AD Info", padding=5)
-        info_frame.pack(fill=tk.X)
-
+        # AD result fields — built dynamically from configured lookup fields
+        self._single_info_frame = ttk.Labelframe(left_frame, text="AD Info",
+                                                 padding=5)
+        self._single_info_frame.pack(fill=tk.X)
         self._single_result_vars = {}
-        result_fields = [
-            ("Name", "displayName"),
-            ("Employee ID", "employeeID"),
-            ("Email", "mail"),
-            ("Student ID", "extensionAttribute8"),
-            ("HR ID", "extensionAttribute2"),
-        ]
-        for i, (label, attr) in enumerate(result_fields):
-            ttk.Label(info_frame, text=f"{label}:").grid(
-                row=i, column=0, sticky=tk.W, padx=(0, 6), pady=1)
-            var = tk.StringVar()
-            entry = ttk.Entry(info_frame, textvariable=var,
-                              state="readonly", width=30)
-            entry.grid(row=i, column=1, sticky=tk.EW, pady=1)
-            self._single_result_vars[attr] = var
-        info_frame.columnconfigure(1, weight=1)
+        self._single_info_left_frame = left_frame  # for future rebuilds
+        self._rebuild_single_info_panel()
 
         # Current plans
         # Labelwidget: title + remove button on the same row as the frame border
@@ -697,7 +1017,7 @@ class TransactAccessManagerApp(tk.Tk):
         #  MIDDLE — Plan Selection & Action (fixed height)
         # ════════════════════════════════════════════════════════════════
         mid_frame = ttk.Frame(main_pane)
-        main_pane.add(mid_frame, minsize=100, stretch="never")
+        main_pane.add(mid_frame, minsize=110, height=130, stretch="never")
 
         plan_frame = ttk.Labelframe(mid_frame, text="Plan Selection & Action",
                                     padding=(10, 5))
@@ -798,7 +1118,7 @@ class TransactAccessManagerApp(tk.Tk):
         #  BOTTOM PANE — Staged Operations (resizable)
         # ════════════════════════════════════════════════════════════════
         bot_pane_frame = ttk.Frame(main_pane)
-        main_pane.add(bot_pane_frame, minsize=100, stretch="always")
+        main_pane.add(bot_pane_frame, minsize=120, height=130, stretch="always")
 
         stage_frame = ttk.Labelframe(bot_pane_frame, text="Staged Operations",
                                      padding=(10, 5))
@@ -949,7 +1269,10 @@ class TransactAccessManagerApp(tk.Tk):
     def _open_settings(self):
         t_creds = self.cred_manager.get_transact_creds()
         a_creds = self.cred_manager.get_ad_creds()
-        dlg = TransactCredentialDialog(self, t_creds, a_creds)
+        dlg = TransactCredentialDialog(
+            self, t_creds, a_creds,
+            lookup_fields=self._lookup_fields,
+            customer_number_attr=self._customer_attr)
         result = dlg.show()
         if not result:
             return
@@ -960,6 +1283,14 @@ class TransactAccessManagerApp(tk.Tk):
             tc["route_scheme"], tc["route_value"])
         self.cred_manager.store_ad_creds(
             ac["server"], ac["username"], ac["password"], ac["use_ssl"])
+
+        # Persist lookup-field config and apply to the UI
+        self.cred_manager.set_lookup_fields(result["lookup_fields"])
+        self.cred_manager.set_customer_number_attr(result["customer_number_attr"])
+        self._lookup_fields = self.cred_manager.get_lookup_fields()
+        self._customer_attr = self.cred_manager.get_customer_number_attr()
+        self._apply_lookup_field_changes()
+
         self._connect_services()
 
     def _show_about(self):
@@ -1303,7 +1634,7 @@ class TransactAccessManagerApp(tk.Tk):
             if self.resolved_users and i < len(self.resolved_users):
                 ru = self.resolved_users[i]
                 if ru:
-                    padded += ["Yes", ru.display_name, ru.employee_id]
+                    padded += ["Yes", ru.display_name, ru.customer_number]
                 else:
                     padded += ["No", "", ""]
             self.input_tree.insert("", tk.END, values=padded)
@@ -1328,7 +1659,7 @@ class TransactAccessManagerApp(tk.Tk):
 
         col_index = self.csv_headers.index(col_name)
         ad_field_label = self.ad_field_combo.get()
-        ad_field = AD_LOOKUP_FIELDS.get(ad_field_label)
+        ad_field = self._attr_for_label(ad_field_label)
         if not ad_field:
             messagebox.showwarning("Config", "Please select an AD field.")
             return
@@ -1359,8 +1690,10 @@ class TransactAccessManagerApp(tk.Tk):
                 self.after(0, lambda c=current, t=total_count:
                            self.resolve_status_var.set(f"Resolving {c}/{t}..."))
 
-        results = self.ad_client.lookup_batch(identifiers, ad_field,
-                                              progress_callback=progress_cb)
+        results = self.ad_client.lookup_batch(
+            identifiers, ad_field,
+            extra_attrs=self._all_lookup_attrs(),
+            progress_callback=progress_cb)
 
         resolved = []
         match_count = 0
@@ -1370,9 +1703,10 @@ class TransactAccessManagerApp(tk.Tk):
                 resolved.append(ResolvedUser(
                     identifier=identifiers[i],
                     display_name=r.get("displayName", "") or "",
-                    employee_id=str(r.get("employeeID", "") or ""),
+                    customer_number=str(r.get(self._customer_attr, "") or ""),
                     email=r.get("mail", "") or "",
                     row_index=i,
+                    extra=dict(r),
                 ))
             else:
                 resolved.append(None)
@@ -1393,8 +1727,6 @@ class TransactAccessManagerApp(tk.Tk):
     # ════════════════════════════════════════════════════════════════════
     #  Single User Lookup
     # ════════════════════════════════════════════════════════════════════
-
-    _SINGLE_EXTRA_ATTRS = ["extensionAttribute8", "extensionAttribute2"]
 
     def _resolve_door_plan_name(self, plan_id):
         """Look up a door plan ID in the cached plan list and return its name."""
@@ -1422,7 +1754,7 @@ class TransactAccessManagerApp(tk.Tk):
             return
 
         ad_field_label = self.single_ad_field_combo.get()
-        ad_field = AD_LOOKUP_FIELDS.get(ad_field_label)
+        ad_field = self._attr_for_label(ad_field_label)
         if not ad_field:
             return
 
@@ -1442,10 +1774,10 @@ class TransactAccessManagerApp(tk.Tk):
         # Use wildcard-aware multi lookup only when needed
         if "*" in search_val:
             results = self.ad_client.lookup_multi(
-                search_val, ad_field, extra_attrs=self._SINGLE_EXTRA_ATTRS)
+                search_val, ad_field, extra_attrs=self._all_lookup_attrs())
         else:
             single = self.ad_client.lookup(
-                search_val, ad_field, extra_attrs=self._SINGLE_EXTRA_ATTRS)
+                search_val, ad_field, extra_attrs=self._all_lookup_attrs())
             results = [single] if single else []
 
         if not results:
@@ -1480,13 +1812,13 @@ class TransactAccessManagerApp(tk.Tk):
                   text=f"{len(results)} results — select one:",
                   padding=8).pack(fill=tk.X)
 
-        cols = ("name", "empid", "email")
+        cols = ("name", "custnum", "email")
         tree = ttk.Treeview(picker, columns=cols, show="headings", height=12)
         tree.heading("name", text="Name")
-        tree.heading("empid", text="Employee ID")
+        tree.heading("custnum", text=self._customer_label())
         tree.heading("email", text="Email")
         tree.column("name", width=180, minwidth=80)
-        tree.column("empid", width=100, minwidth=60)
+        tree.column("custnum", width=100, minwidth=60)
         tree.column("email", width=200, minwidth=80)
 
         vsb = ttk.Scrollbar(picker, orient=tk.VERTICAL, command=tree.yview)
@@ -1501,9 +1833,9 @@ class TransactAccessManagerApp(tk.Tk):
 
         for i, r in enumerate(results):
             name = str(r.get("displayName", "") or "")
-            empid = str(r.get("employeeID", "") or "")
+            custnum = str(r.get(self._customer_attr, "") or "")
             email = str(r.get("mail", "") or "")
-            tree.insert("", tk.END, iid=str(i), values=(name, empid, email))
+            tree.insert("", tk.END, iid=str(i), values=(name, custnum, email))
 
         chosen = [None]
 
@@ -1549,7 +1881,7 @@ class TransactAccessManagerApp(tk.Tk):
         if result and self.api_client:
             # Re-auth now, right before the Transact API calls
             self.api_client.reauthenticate()
-            emp_id = str(result.get("employeeID", "") or "")
+            emp_id = str(result.get(self._customer_attr, "") or "")
             if emp_id:
                 door_plans, _ = self.api_client.get_customer_door_plans(emp_id)
                 board_plans, _ = self.api_client.get_customer_board_plans(emp_id)
@@ -1599,9 +1931,10 @@ class TransactAccessManagerApp(tk.Tk):
         self._single_resolved_user = ResolvedUser(
             identifier=search_val,
             display_name=str(result.get("displayName", "") or ""),
-            employee_id=str(result.get("employeeID", "") or ""),
+            customer_number=str(result.get(self._customer_attr, "") or ""),
             email=str(result.get("mail", "") or ""),
             row_index=0,
+            extra=dict(result),
         )
 
         # Populate current plans tree with resolved names
@@ -1652,7 +1985,7 @@ class TransactAccessManagerApp(tk.Tk):
         item = self.single_plans_tree.item(iid)
         plan_name = item["values"][1] if len(item["values"]) > 1 else str(plan_id)
 
-        emp_id = self._single_resolved_user.employee_id
+        emp_id = self._single_resolved_user.customer_number
         confirm = messagebox.askyesno(
             "Confirm Removal",
             f"Remove {'door' if plan_type == 'D' else 'meal'} plan "
@@ -1793,7 +2126,7 @@ class TransactAccessManagerApp(tk.Tk):
                 i + 1,
                 sa.user.identifier,
                 sa.user.display_name,
-                sa.user.employee_id,
+                sa.user.customer_number,
                 sa.action,
                 sa.plan_type,
                 sa.plan_name,
@@ -1908,7 +2241,7 @@ class TransactAccessManagerApp(tk.Tk):
 
     def _execute_action(self, sa):
         """Execute a single staged action. Returns (success, error_code, message)."""
-        cn = sa.user.employee_id
+        cn = sa.user.customer_number
         if sa.plan_type == "Door Access":
             if sa.action == "Add":
                 return self.api_client.add_customer_door_plan(cn, sa.plan_id)
@@ -1935,7 +2268,7 @@ class TransactAccessManagerApp(tk.Tk):
                 idx + 1,
                 sa.user.identifier,
                 sa.user.display_name,
-                sa.user.employee_id,
+                sa.user.customer_number,
                 sa.action,
                 sa.plan_type,
                 sa.plan_name,
@@ -2011,7 +2344,7 @@ class TransactAccessManagerApp(tk.Tk):
             for sa in failures:
                 writer.writerow([
                     sa.user.identifier,
-                    sa.user.employee_id,
+                    sa.user.customer_number,
                     sa.action,
                     sa.plan_type,
                     sa.plan_name,
@@ -2063,7 +2396,7 @@ class TransactAccessManagerApp(tk.Tk):
 
         for count, idx in enumerate(pending_indices):
             sa = self.staged_actions[idx]
-            emp_id = sa.user.employee_id
+            emp_id = sa.user.customer_number
 
             self.after(0, lambda i=idx: self._set_row_status(i, "Validating..."))
 
@@ -2292,7 +2625,7 @@ class TransactAccessManagerApp(tk.Tk):
         if not self._single_resolved_user:
             return
 
-        emp_id = self._single_resolved_user.employee_id
+        emp_id = self._single_resolved_user.customer_number
         name = self._single_resolved_user.display_name
         reason = self.retire_reason_var.get().strip()
 
@@ -2309,7 +2642,7 @@ class TransactAccessManagerApp(tk.Tk):
             if current[3] != original[3]:  # status changed
                 detail = f"{original[3]} -> {current[3]}"
                 sa = StagedCardAction(
-                    employee_id=emp_id, display_name=name,
+                    customer_number=emp_id, display_name=name,
                     action_type="Card Status", card_number=card_num,
                     detail=detail, old_value=original[3],
                     new_value=current[3],
@@ -2320,7 +2653,7 @@ class TransactAccessManagerApp(tk.Tk):
             if current[5] != original[5]:  # lost changed
                 detail = f"Lost: {original[5]} -> {current[5]}"
                 sa = StagedCardAction(
-                    employee_id=emp_id, display_name=name,
+                    customer_number=emp_id, display_name=name,
                     action_type="Card Lost", card_number=card_num,
                     detail=detail, old_value=original[5],
                     new_value=current[5])
@@ -2330,7 +2663,7 @@ class TransactAccessManagerApp(tk.Tk):
             if current[1] != original[1]:  # issue changed
                 detail = f"Issue: {original[1]} -> {current[1]}"
                 sa = StagedCardAction(
-                    employee_id=emp_id, display_name=name,
+                    customer_number=emp_id, display_name=name,
                     action_type="Card Issue", card_number=card_num,
                     detail=detail, old_value=original[1],
                     new_value=current[1])
@@ -2354,7 +2687,7 @@ class TransactAccessManagerApp(tk.Tk):
             messagebox.showwarning("No User", "Look up a user first.")
             return
 
-        emp_id = self._single_resolved_user.employee_id
+        emp_id = self._single_resolved_user.customer_number
         name = self._single_resolved_user.display_name
         reason = self.retire_reason_var.get().strip()
 
@@ -2370,7 +2703,7 @@ class TransactAccessManagerApp(tk.Tk):
 
             detail = f"{status} -> RETIRED ({ctype})"
             sa = StagedCardAction(
-                employee_id=emp_id, display_name=name,
+                customer_number=emp_id, display_name=name,
                 action_type="Card Status", card_number=card_num,
                 detail=detail, old_value=status,
                 new_value="RETIRED",
@@ -2393,12 +2726,12 @@ class TransactAccessManagerApp(tk.Tk):
             messagebox.showwarning("No User", "Look up a user first.")
             return
 
-        emp_id = self._single_resolved_user.employee_id
+        emp_id = self._single_resolved_user.customer_number
         name = self._single_resolved_user.display_name
         action = "Activate" if active else "Deactivate"
 
         sa = StagedCardAction(
-            employee_id=emp_id, display_name=name,
+            customer_number=emp_id, display_name=name,
             action_type="Customer Active",
             detail=f"{action} customer",
             new_value=str(active))
@@ -2413,7 +2746,7 @@ class TransactAccessManagerApp(tk.Tk):
             if tag not in ("pending", "success", "failed", "processing"):
                 tag = "pending"
             self.card_queue_tree.insert("", tk.END, iid=str(i), values=(
-                sa.employee_id, sa.action_type, sa.card_number,
+                sa.customer_number, sa.action_type, sa.card_number,
                 sa.detail, sa.status), tags=(tag,))
 
         has_pending = any(sa.status == "Pending" for sa in self._card_queue)
@@ -2435,7 +2768,7 @@ class TransactAccessManagerApp(tk.Tk):
             return
 
         summary = "\n".join(
-            f"  {sa.action_type}: {sa.card_number or sa.employee_id} "
+            f"  {sa.action_type}: {sa.card_number or sa.customer_number} "
             f"- {sa.detail}"
             for sa in pending)
         if not messagebox.askyesno(
@@ -2465,14 +2798,14 @@ class TransactAccessManagerApp(tk.Tk):
             if sa.action_type == "Card Status":
                 comment = sa.reason if sa.new_value == "RETIRED" else None
                 success, error_code, message = self.api_client.update_card_status(
-                    sa.employee_id, sa.card_number,
+                    sa.customer_number, sa.card_number,
                     status_type=sa.new_value,
                     comment=comment)
 
             elif sa.action_type == "Card Lost":
                 lost_bool = sa.new_value == "True"
                 # Need current status for PATCH
-                cards, _ = self.api_client.get_customer_cards(sa.employee_id)
+                cards, _ = self.api_client.get_customer_cards(sa.customer_number)
                 cur_status = "ACTIVE"
                 for c in cards:
                     cn = str(c.get("cardNumber") or c.get("CardNumber") or "")
@@ -2481,11 +2814,11 @@ class TransactAccessManagerApp(tk.Tk):
                                       or c.get("cardStatusType") or "ACTIVE")
                         break
                 success, error_code, message = self.api_client.update_card_status(
-                    sa.employee_id, sa.card_number,
+                    sa.customer_number, sa.card_number,
                     status_type=cur_status, lost=lost_bool)
 
             elif sa.action_type == "Card Issue":
-                cards, _ = self.api_client.get_customer_cards(sa.employee_id)
+                cards, _ = self.api_client.get_customer_cards(sa.customer_number)
                 cur_status = "ACTIVE"
                 for c in cards:
                     cn = str(c.get("cardNumber") or c.get("CardNumber") or "")
@@ -2494,20 +2827,20 @@ class TransactAccessManagerApp(tk.Tk):
                                       or c.get("cardStatusType") or "ACTIVE")
                         break
                 success, error_code, message = self.api_client.update_card_status(
-                    sa.employee_id, sa.card_number,
+                    sa.customer_number, sa.card_number,
                     status_type=cur_status, issue_number=sa.new_value)
 
             elif sa.action_type == "Customer Active":
                 active_bool = sa.new_value == "True"
                 success, error_code, message = self.api_client.update_customer(
-                    sa.employee_id, active=active_bool)
+                    sa.customer_number, active=active_bool)
 
             sa.status = "Success" if success else "Failed"
             sa.error_message = "" if success else message
-            refreshed_emp_ids.add(sa.employee_id)
+            refreshed_emp_ids.add(sa.customer_number)
 
             self._audit_log("CARD_QUEUE",
-                            f"{sa.action_type}\t{sa.employee_id}\t"
+                            f"{sa.action_type}\t{sa.customer_number}\t"
                             f"{sa.card_number}\t{sa.detail}\t{sa.status}"
                             f"\t{sa.error_message}")
 
@@ -2531,8 +2864,8 @@ class TransactAccessManagerApp(tk.Tk):
 
         # Refresh cards for the looked-up user if applicable
         if (self._single_resolved_user and
-                self._single_resolved_user.employee_id in refreshed_emp_ids):
-            self._refresh_cards(self._single_resolved_user.employee_id)
+                self._single_resolved_user.customer_number in refreshed_emp_ids):
+            self._refresh_cards(self._single_resolved_user.customer_number)
 
     def _refresh_cards(self, emp_id):
         """Re-fetch and display cards for the given employee."""
@@ -2656,12 +2989,12 @@ class TransactAccessManagerApp(tk.Tk):
                 continue
             self._audit_log("COMMIT", (
                 f"{sa.action}\t{sa.plan_type}\t{sa.plan_name}\t"
-                f"{sa.user.identifier}\t{sa.user.employee_id}\t"
+                f"{sa.user.identifier}\t{sa.user.customer_number}\t"
                 f"{sa.status}\t{sa.error_message}"))
 
     def _audit_card_change(self, card_num, field, old_val, new_val, success):
         """Log a card status change."""
-        emp_id = (self._single_resolved_user.employee_id
+        emp_id = (self._single_resolved_user.customer_number
                   if self._single_resolved_user else "?")
         self._audit_log("CARD", (
             f"{card_num}\t{emp_id}\t{field}: {old_val}->{new_val}\t"
@@ -2763,21 +3096,14 @@ class TransactAccessManagerApp(tk.Tk):
             except Exception:
                 pass
 
-        ad_field = settings.get("ad_field_bulk")
-        if ad_field:
-            try:
-                idx = list(AD_LOOKUP_FIELDS.keys()).index(ad_field)
-                self.ad_field_combo.current(idx)
-            except (ValueError, IndexError):
-                pass
-
-        ad_field_single = settings.get("ad_field_single")
-        if ad_field_single:
-            try:
-                idx = list(AD_LOOKUP_FIELDS.keys()).index(ad_field_single)
-                self.single_ad_field_combo.current(idx)
-            except (ValueError, IndexError):
-                pass
+        # Saved values may be labels (legacy) or AD attributes (current).
+        # Try both: attribute first, then label.
+        self._select_lookup_combo(self.ad_field_combo,
+                                  settings.get("ad_field_bulk_attr")
+                                  or settings.get("ad_field_bulk"))
+        self._select_lookup_combo(self.single_ad_field_combo,
+                                  settings.get("ad_field_single_attr")
+                                  or settings.get("ad_field_single"))
 
         plan_tab = settings.get("plan_tab")
         if plan_tab is not None:
@@ -2794,8 +3120,14 @@ class TransactAccessManagerApp(tk.Tk):
         """Persist current UI state to settings.json."""
         settings = self.cred_manager.load_settings()
         settings["window_geometry"] = self.geometry()
-        settings["ad_field_bulk"] = self.ad_field_combo.get()
-        settings["ad_field_single"] = self.single_ad_field_combo.get()
+        # Store by attribute so renaming labels doesn't break persistence.
+        settings["ad_field_bulk_attr"] = (
+            self._attr_for_label(self.ad_field_combo.get()) or "")
+        settings["ad_field_single_attr"] = (
+            self._attr_for_label(self.single_ad_field_combo.get()) or "")
+        # Drop legacy label-based keys
+        settings.pop("ad_field_bulk", None)
+        settings.pop("ad_field_single", None)
         try:
             settings["plan_tab"] = self.plan_notebook.index(
                 self.plan_notebook.select())
@@ -2803,6 +3135,20 @@ class TransactAccessManagerApp(tk.Tk):
             pass
         settings["hide_retired"] = self.hide_retired_var.get()
         self.cred_manager.save_settings(settings)
+
+    def _select_lookup_combo(self, combo, value):
+        """Select a lookup-field combo entry by attr name or legacy label."""
+        if not value:
+            return
+        labels = self._lookup_labels()
+        # Match by attr
+        label = self._label_for_attr(value)
+        if label and label in labels:
+            combo.set(label)
+            return
+        # Match by legacy label
+        if value in labels:
+            combo.set(value)
 
     def destroy(self):
         """Override destroy to save settings on exit."""
@@ -2848,8 +3194,11 @@ class TransactAccessManagerApp(tk.Tk):
             "board_active": self.board_active_var.get(),
             "start_date": self.start_date_entry.get(),
             "end_date": self.end_date_entry.get(),
-            "ad_field_bulk": self.ad_field_combo.get(),
-            "ad_field_single": self.single_ad_field_combo.get(),
+            # Store by AD attribute so renaming labels doesn't break profiles
+            "ad_field_bulk_attr": (
+                self._attr_for_label(self.ad_field_combo.get()) or ""),
+            "ad_field_single_attr": (
+                self._attr_for_label(self.single_ad_field_combo.get()) or ""),
         }
         path = os.path.join(self._PROFILES_DIR, f"{name}.json")
         with open(path, "w") as f:
@@ -2899,21 +3248,13 @@ class TransactAccessManagerApp(tk.Tk):
         if end:
             self.end_date_entry.insert(0, end)
 
-        ad_bulk = profile.get("ad_field_bulk")
-        if ad_bulk:
-            try:
-                idx = list(AD_LOOKUP_FIELDS.keys()).index(ad_bulk)
-                self.ad_field_combo.current(idx)
-            except (ValueError, IndexError):
-                pass
-
-        ad_single = profile.get("ad_field_single")
-        if ad_single:
-            try:
-                idx = list(AD_LOOKUP_FIELDS.keys()).index(ad_single)
-                self.single_ad_field_combo.current(idx)
-            except (ValueError, IndexError):
-                pass
+        self._select_lookup_combo(
+            self.ad_field_combo,
+            profile.get("ad_field_bulk_attr") or profile.get("ad_field_bulk"))
+        self._select_lookup_combo(
+            self.single_ad_field_combo,
+            profile.get("ad_field_single_attr")
+            or profile.get("ad_field_single"))
 
         self._log(f"Profile '{name}' loaded.")
 
@@ -3046,7 +3387,7 @@ class TransactAccessManagerApp(tk.Tk):
         rows = []
         total = len(users)
         for i, u in enumerate(users):
-            emp_id = u.employee_id
+            emp_id = u.customer_number
             door_plans, _ = self.api_client.get_customer_door_plans(emp_id)
             board_plans, _ = self.api_client.get_customer_board_plans(emp_id)
 
