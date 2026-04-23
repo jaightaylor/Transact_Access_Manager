@@ -1002,10 +1002,12 @@ class TransactAccessManagerApp(tk.Tk):
         card_queue_frame.columnconfigure(0, weight=1)
         _treeview_sort_setup(self.card_queue_tree)
 
-        self.card_queue_tree.tag_configure("pending", foreground="black")
-        self.card_queue_tree.tag_configure("success", foreground="green")
-        self.card_queue_tree.tag_configure("failed", foreground="red")
-        self.card_queue_tree.tag_configure("processing", foreground="blue")
+        # "pending" uses the default tree foreground so it adapts to
+        # light/dark mode. Other states use distinct colors that stay
+        # readable on both backgrounds.
+        self.card_queue_tree.tag_configure("success", foreground="#228B22")
+        self.card_queue_tree.tag_configure("failed", foreground="#D32F2F")
+        self.card_queue_tree.tag_configure("processing", foreground="#1976D2")
 
         # Card action queue data
         self._card_queue = []  # list of StagedCardAction
@@ -1174,11 +1176,13 @@ class TransactAccessManagerApp(tk.Tk):
         _treeview_sort_setup(self.stage_tree)
 
         # Tag colours
-        self.stage_tree.tag_configure("pending", foreground="black")
-        self.stage_tree.tag_configure("processing", foreground="blue")
-        self.stage_tree.tag_configure("success", foreground="green")
-        self.stage_tree.tag_configure("failed", foreground="red")
-        self.stage_tree.tag_configure("already", foreground="orange")
+        # "pending" uses the default tree foreground so it adapts to
+        # light/dark mode. Other states use distinct colors tuned to stay
+        # readable on both light and dark backgrounds.
+        self.stage_tree.tag_configure("processing", foreground="#1976D2")
+        self.stage_tree.tag_configure("success", foreground="#228B22")
+        self.stage_tree.tag_configure("failed", foreground="#D32F2F")
+        self.stage_tree.tag_configure("already", foreground="#E67E22")
 
         # ── Bottom bar: progress + commit ───────────────────────────────
         bottom = ttk.Frame(self)
